@@ -1,12 +1,14 @@
+#pragma once
 #include <cstdint>
+#include <cstddef>
 #include <GL/gl.h>
 
 namespace Video {
 
 enum class DecodeMode {
     Auto,
-    CPU,
-    GPU
+    GPU,  
+    CPU
 };
 
 enum class VideoCodec {
@@ -23,22 +25,21 @@ enum class RtspTransport {
 };
 
 struct DecoderConfig {
-    DecodeMode decodeMode = DecodeMode::Auto;
-    VideoCodec codec = VideoCodec::Auto;
+    DecodeMode   decodeMode = DecodeMode::Auto;
+    VideoCodec   codec      = VideoCodec::Auto;
     RtspTransport transport = RtspTransport::Auto;
+    size_t       timeout    = 5;   
+    size_t       watchdogSeconds = 10; 
 };
 
 struct GLContextHandle {
     void* context = nullptr;
 };
 
-
 struct Frame {
-    GLuint texture = 0;
-
-    uint32_t width = 0;
-    uint32_t height = 0;
+    GLuint   texture = 0;
+    uint32_t width   = 0;
+    uint32_t height  = 0;
 };
-
 
 } // namespace Video
