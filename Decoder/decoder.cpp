@@ -1,4 +1,4 @@
-#include "rtsp_decoder.h"
+#include "decoder.h"
 
 #include <gst/gst.h>
 #include <gst/app/gstappsink.h>
@@ -10,9 +10,11 @@
 #include <GL/glx.h>
 
 #include <mutex>
+#include <condition_variable>
 #include <thread>
 #include <atomic>
 #include <vector>
+#include <deque>
 #include <string>
 #include <cstdio>
 #include <chrono>
@@ -67,18 +69,77 @@ struct Decoder::Impl_ {
 
     std::thread retryThread;
 
+    // ---------------------------------------------------- command queue
+    // 所有对外的控制操作（start/stop/reset）都被封装成 command，push 进队列后
+    // 立即返回，真正的执行放在常驻的 cmdThread 里严格串行处理。
+    // 这样可以保证：
+    //   1) 调用方（通常是 UI 线程）永远是微秒级的入队操作，不会卡顿；
+    //   2) 同一个 Decoder 的 start/stop/reset 不会因为各自开线程而产生竞态
+    //      （比如 stop 抢在 start 前面跑完导致状态错乱）。
+    enum class CmdType { Start, Stop, Reset };
+    struct Command {
+        CmdType         type;
+        GLContextHandle ctx;
+    };
+
+    std::mutex              cmdMutex;
+    std::condition_variable cmdCv;
+    std::deque<Command>     cmdQueue;
+    std::thread             cmdThread;
+    std::atomic<bool>       shuttingDown{false};
+
+    void startCommandThread() {
+        cmdThread = std::thread([this]() { commandLoop(); });
+    }
+
+    void commandLoop() {
+        while (true) {
+            Command cmd;
+            {
+                std::unique_lock<std::mutex> lock(cmdMutex);
+                cmdCv.wait(lock, [this]() {
+                    return !cmdQueue.empty() || shuttingDown;
+                });
+                if (shuttingDown && cmdQueue.empty()) return;
+                cmd = cmdQueue.front();
+                cmdQueue.pop_front();
+            }
+            switch (cmd.type) {
+            case CmdType::Start: doStart(cmd.ctx); break;
+            case CmdType::Stop:  doStop();         break;
+            case CmdType::Reset: doReset();        break;
+            }
+        }
+    }
+
+    void postCommand(CmdType type, const GLContextHandle& ctx = nullptr) {
+        {
+            std::lock_guard<std::mutex> lock(cmdMutex);
+            cmdQueue.push_back({type, ctx});
+        }
+        cmdCv.notify_one();
+    }
+
     // ------------------------------------------------------------------ dtor
     ~Impl_() {
+        // 先停止接收新命令，等 command 线程处理完队列里剩余的命令并退出，
+        // 保证退出前不会有“半路而废”的 start/stop 还挂在队列里。
+        shuttingDown = true;
+        cmdCv.notify_one();
+        if (cmdThread.joinable()) cmdThread.join();
+
+        // command 线程已退出，之后不会再有新命令进来，可以安全地直接彻底清理。
         shouldRun = false;
-        stopInternal();
+        stopInternal(/*releaseAll=*/true);
         if (retryThread.joinable()) retryThread.join();
+
         if (glContext) { gst_object_unref(glContext); glContext = nullptr; }
         if (glDisplay) { gst_object_unref(glDisplay); glDisplay = nullptr; }
         if (xDisplay && ownsXDisplay) { XCloseDisplay(xDisplay); xDisplay = nullptr; }
     }
 
     // --------------------------------------------------------- GL context wrap
-    // 只包装，不 activate / fill_info（那两步要求 GL current，不能在重试线程调）
+    // 只包装，不 activate / fill_info（那两步要求 GL current，不能在后台线程调）
     // GStreamer 在 pipeline 启动时通过 busSyncHandler 拿到 context 自行初始化。
     bool setupGLContext() {
         GLXContext ctx = static_cast<GLXContext>(glCtxHandle.context);
@@ -249,24 +310,6 @@ struct Decoder::Impl_ {
         return desc;
     }
 
-    // std::string buildPipelineDesc(RtspTransport transport, DecodeMode mode, VideoCodec codec) const {
-    //     std::string desc =
-    //         "rtspsrc name=src location=\"" + url +
-    //         "\" latency=0 protocols=" + transportStr(transport) + " ! ";
-
-    //     if (codec == VideoCodec::Auto) {
-    //         desc += "decodebin name=dbin ! ";
-    //     } else {
-    //         desc += codecDecodeChain(codec, mode) + " ! ";
-    //     }
-
-    //     desc += "glupload ! glcolorconvert ! "
-    //             "appsink name=sink "
-    //             "caps=\"video/x-raw(memory:GLMemory),format=RGBA\" "
-    //             "sync=false max-buffers=1 drop=true emit-signals=true";
-    //     return desc;
-    // }
-
     static gboolean autoplugSelectFilter(GstElement*, GstPad*, GstCaps*,
                                          GstElementFactory* factory, gpointer userData) {
         auto wantGpu = *static_cast<DecodeMode*>(userData) == DecodeMode::GPU;
@@ -381,7 +424,14 @@ struct Decoder::Impl_ {
     }
 
     // ---------------------------------------------------- teardown
-    void stopInternal() {
+    // releaseAll = false（默认）：软停止。
+    //   - 停掉 pipeline / 线程 / bus watch，rtspsrc 发 TEARDOWN，彻底断开网络连接、
+    //     不再占用带宽；
+    //   - 但保留 currentSample / publicFrame（最后一帧），保留 glContext / glDisplay /
+    //     xDisplay，这样下一次 start 只需重新 wrap 一次 GL context 并重建 pipeline，
+    //     不需要重新 XOpenDisplay，重启最快。
+    // releaseAll = true：彻底清空，用于析构或显式 reset。
+    void stopInternal(bool releaseAll = false) {
         running = false;
 
         if (loop) g_main_loop_quit(loop);
@@ -390,14 +440,20 @@ struct Decoder::Impl_ {
 
         if (busWatchId) { g_source_remove(busWatchId); busWatchId = 0; }
 
+        // 状态置 NULL 会让 rtspsrc 发 TEARDOWN，断开网络连接、停止占用带宽
         if (pipeline) gst_element_set_state(pipeline, GST_STATE_NULL);
         if (appsink)  { gst_object_unref(appsink);  appsink  = nullptr; }
         if (pipeline) { gst_object_unref(pipeline); pipeline = nullptr; }
 
         std::lock_guard<std::mutex> lock(frameMutex);
         if (pendingSample) { gst_sample_unref(pendingSample); pendingSample = nullptr; }
-        if (currentSample) { gst_sample_unref(currentSample); currentSample = nullptr; }
-        publicFrame = Frame{};
+
+        if (releaseAll) {
+            if (currentSample) { gst_sample_unref(currentSample); currentSample = nullptr; }
+            publicFrame = Frame{};
+        }
+        // releaseAll == false 时 currentSample / publicFrame 保留，
+        // getFrame() 在停止期间仍能返回最后一帧，避免画面闪黑
     }
 
     // ---------------------------------------------------- watchdog
@@ -420,7 +476,8 @@ struct Decoder::Impl_ {
                                config.timeout);
                 }
 
-                stopInternal();
+                // 内部重试：软停止即可，紧接着会重建 pipeline
+                stopInternal(/*releaseAll=*/false);
 
                 // 等待 timeout 秒再重试
                 for (size_t i = 0; i < config.timeout * 5 && shouldRun; ++i) {
@@ -441,14 +498,31 @@ struct Decoder::Impl_ {
         }
     }
 
-    // ---------------------------------------------------- public start
-    bool start(const GLContextHandle& glContextIn) {
-        if (shouldRun) return true;
+    // ---------------------------------------------------- doStart / doStop / doReset
+    // 以下三个函数只应由 commandLoop() 在 cmdThread 里串行调用，
+    // 不要在其它线程直接调用，否则会破坏“同一 decoder 操作全串行”的保证。
 
-        glCtxHandle = glContextIn;
-        shouldRun   = true;
+    // glContextIn 允许为空（GLContextHandle::context == nullptr）：
+    //   - 如果之前 start 过并保存过 context，则复用之前保存的那份；
+    //   - 如果从未 start 过且没有传入 context，则失败。
+    // 如果 shouldRun 已经为 true（正在运行中，或正处于重试等待中），
+    // 说明已经启动过，直接返回，不重复触发。
+    bool doStart(const GLContextHandle& glContextIn) {
+        if (shouldRun) {
+            return true;
+        }
 
-        // setupGLContext 第一次在 GUI 线程（GL context current）调用
+        bool hasNewContext = glContextIn.context != nullptr;
+        if (hasNewContext) {
+            glCtxHandle = glContextIn;
+        } else if (!glCtxHandle.context) {
+            g_printerr("Decoder: start() called without a GL context and none was previously set\n");
+            return false;
+        }
+        // else: 没传新 context，但之前已保存过一份，直接复用 glCtxHandle
+
+        shouldRun = true;
+
         if (!setupGLContext()) {
             g_printerr("Decoder: setupGLContext failed on start\n");
             shouldRun = false;
@@ -462,13 +536,25 @@ struct Decoder::Impl_ {
         return true;
     }
 
-    void stop() {
+    // 软停止：断开网络连接（停止占用带宽），但保留最后一帧和 GL context，
+    // 以便下一次 start 能最快重启。
+    void doStop() {
+        if (!shouldRun) return; // 已经停了，无需重复操作
         shouldRun = false;
-        stopInternal();
+        stopInternal(/*releaseAll=*/false);
+        if (retryThread.joinable()) retryThread.join();
+    }
+
+    // 彻底重置：清空最后一帧 / publicFrame，仅保留 GL context 直到析构。
+    void doReset() {
+        shouldRun = false;
+        stopInternal(/*releaseAll=*/true);
         if (retryThread.joinable()) retryThread.join();
     }
 
     // ---------------------------------------------------- getFrame
+    // 唯一保留的同步/阻塞接口：纯内存操作（取指针 + 拷贝宽高），微秒级，
+    // 不涉及网络或 GL 初始化，可以放心在 UI 线程里高频调用。
     const Frame* getFrame() {
         std::lock_guard<std::mutex> lock(frameMutex);
 
@@ -509,6 +595,7 @@ struct Decoder::Impl_ {
 Decoder::Decoder(const std::string& url) : m_impl(new Impl_()) {
     ensureGstInit();
     m_impl->url = url;
+    m_impl->startCommandThread();
 }
 
 Decoder::~Decoder() {
@@ -519,16 +606,21 @@ void Decoder::setConfig(const DecoderConfig& config) {
     m_impl->config = config;
 }
 
-bool Decoder::start(const GLContextHandle& glContext) {
-    return m_impl->start(glContext);
+// 异步：立即返回，仅将 Start 命令入队。真正是否连上、是否有画面，
+// 靠 isRunning() / hasFrame() 轮询判断。
+void Decoder::start(const GLContextHandle& glContext) {
+    m_impl->postCommand(Impl_::CmdType::Start, glContext);
 }
 
+// 异步：立即返回，仅将 Stop 命令入队。
+// 软停止：断网、保留最后一帧和 GL context，便于下次 start 最快重启。
 void Decoder::stop() {
-    m_impl->stop();
+    m_impl->postCommand(Impl_::CmdType::Stop);
 }
 
+// 异步：立即返回，仅将 Reset 命令入队。彻底清空最后一帧。
 void Decoder::reset() {
-    m_impl->stop();
+    m_impl->postCommand(Impl_::CmdType::Reset);
 }
 
 bool Decoder::isRunning() const {
@@ -539,9 +631,9 @@ bool Decoder::hasFrame() const {
     return m_impl->hasFrame();
 }
 
+// 唯一保留的阻塞接口，纯内存操作，可放心高频调用
 const Frame* Decoder::getFrame() const {
     return m_impl->getFrame();
 }
 
 } // namespace Video
-

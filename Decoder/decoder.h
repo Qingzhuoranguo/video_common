@@ -4,22 +4,23 @@
 #include <string>
 
 namespace Video {
+    
 class Decoder {
-    public:
+public:
     explicit Decoder(const std::string& url);
     ~Decoder();
-    
+
     void setConfig(const DecoderConfig& config);
-    
-    bool start(const GLContextHandle& glContext); 
+
+    void start(const GLContextHandle& glContext = GLContextHandle(nullptr));
     void stop();
     void reset();
-    
+
     bool isRunning() const;
-    
+
     bool hasFrame() const;
     const Frame* getFrame() const;
-    
+
 private:
     struct Impl_;
     Impl_ *m_impl;
@@ -29,5 +30,4 @@ private:
     Decoder(Decoder&&) = delete;
     Decoder& operator=(Decoder&&) = delete;
 };
-
 } // namespace Video

@@ -28,12 +28,13 @@ struct DecoderConfig {
     DecodeMode   decodeMode = DecodeMode::Auto;
     VideoCodec   codec      = VideoCodec::Auto;
     RtspTransport transport = RtspTransport::Auto;
-    size_t       timeout    = 3;
-    size_t       watchdogSeconds = 5;
+    size_t       timeout    = 5;
+    size_t       watchdogSeconds = 10;
 };
 
 struct GLContextHandle {
     void* context = nullptr;
+    GLContextHandle(void* ctx = nullptr) : context(ctx) {}
 };
 
 struct Frame {
@@ -41,6 +42,5 @@ struct Frame {
     uint32_t width   = 0;
     uint32_t height  = 0;
 };
-
 
 } // namespace Video
