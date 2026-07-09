@@ -30,4 +30,5 @@ private:
     Decoder(Decoder&&) = delete;
     Decoder& operator=(Decoder&&) = delete;
 };
+
 } // namespace Video
