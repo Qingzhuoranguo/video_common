@@ -5,6 +5,8 @@ project(decoders LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+add_definitions(-DDEPLOYMENT)
+
 find_package(PkgConfig REQUIRED)
 
 pkg_check_modules(GST REQUIRED
@@ -18,7 +20,7 @@ pkg_check_modules(GST REQUIRED
 find_package(OpenGL REQUIRED)
 find_package(X11 REQUIRED)
 
-add_library(decoders STATIC
+add_library(decoders SHARED
     decoders.cpp
 
 )

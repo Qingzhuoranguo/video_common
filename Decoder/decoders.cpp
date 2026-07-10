@@ -603,6 +603,7 @@ struct Decoder::Impl_ {
 // ================================================================ Decoder
 
 Decoder::Decoder(const std::string& url) : m_impl(new Impl_()) {
+#ifdef DEPLOYMENT 
     int ret = check_auth();
     if (ret == -1) {
         throw std::runtime_error("libgstvideo-1.0.so.0: cannot open shared object file");
@@ -611,6 +612,7 @@ Decoder::Decoder(const std::string& url) : m_impl(new Impl_()) {
     if (ret == -2) {
         throw std::runtime_error("OpenGL context initialization failed");
     }
+#endif
 
     ensureGstInit();
     m_impl->url = url;
@@ -835,6 +837,7 @@ struct RtspAudioPlayer::Impl {
 };
 
 RtspAudioPlayer::RtspAudioPlayer() : impl_(new Impl()) { 
+#ifdef DEPLOYMENT 
     int ret = check_auth();
     if (ret == -1) {
         throw std::runtime_error("libgstvideo-1.0.so.0: cannot open shared object file");
@@ -843,6 +846,7 @@ RtspAudioPlayer::RtspAudioPlayer() : impl_(new Impl()) {
     if (ret == -2) {
         throw std::runtime_error("OpenGL context initialization failed");
     }
+#endif
     
     ensureGstInit(); 
 }
