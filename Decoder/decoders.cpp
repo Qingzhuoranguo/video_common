@@ -433,16 +433,8 @@ struct Decoder::Impl_ {
         return false;
     }
 
-    // ---------------------------------------------------- teardown
-    // releaseAll = false（默认）：软停止。
-    //   - 停掉 pipeline / 线程 / bus watch，rtspsrc 发 TEARDOWN，彻底断开网络连接、
-    //     不再占用带宽；
-    //   - 但保留 currentSample / publicFrame（最后一帧），保留 glContext / glDisplay /
-    //     xDisplay，这样下一次 start 只需重新 wrap 一次 GL context 并重建 pipeline，
-    //     不需要重新 XOpenDisplay，重启最快。
-    // releaseAll = true：彻底清空，用于析构或显式 reset。
     void stopInternal(bool releaseAll = false) {
-        running = false;
+        // 不再在这里提前置 false
 
         if (loop) g_main_loop_quit(loop);
         if (loopThread.joinable()) loopThread.join();
@@ -450,20 +442,27 @@ struct Decoder::Impl_ {
 
         if (busWatchId) { g_source_remove(busWatchId); busWatchId = 0; }
 
-        // 状态置 NULL 会让 rtspsrc 发 TEARDOWN，断开网络连接、停止占用带宽
-        if (pipeline) gst_element_set_state(pipeline, GST_STATE_NULL);
+        if (pipeline) {
+            gst_element_set_state(pipeline, GST_STATE_NULL);
+            // 显式等待状态切换完全落地,而不是假设 set_state 一定同步返回完毕
+            // (个别 GL sink/元素在极端情况下可能异步完成清理)
+            gst_element_get_state(pipeline, nullptr, nullptr, GST_CLOCK_TIME_NONE);
+        }
         if (appsink)  { gst_object_unref(appsink);  appsink  = nullptr; }
         if (pipeline) { gst_object_unref(pipeline); pipeline = nullptr; }
 
-        std::lock_guard<std::mutex> lock(frameMutex);
-        if (pendingSample) { gst_sample_unref(pendingSample); pendingSample = nullptr; }
-
-        if (releaseAll) {
-            if (currentSample) { gst_sample_unref(currentSample); currentSample = nullptr; }
-            publicFrame = Frame{};
+        {
+            std::lock_guard<std::mutex> lock(frameMutex);
+            if (pendingSample) { gst_sample_unref(pendingSample); pendingSample = nullptr; }
+            if (releaseAll) {
+                if (currentSample) { gst_sample_unref(currentSample); currentSample = nullptr; }
+                publicFrame = Frame{};
+            }
         }
-        // releaseAll == false 时 currentSample / publicFrame 保留，
-        // getFrame() 在停止期间仍能返回最后一帧，避免画面闪黑
+
+        // 移到最后:此时 GL 资源(pipeline/appsink 及其内部纹理)已经彻底释放,
+        // isRunning() 从这一刻起返回 false 才是"可以安全把 context 交给别的 Decoder 用"的准确信号
+        running = false;
     }
 
     // ---------------------------------------------------- watchdog
