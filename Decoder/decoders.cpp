@@ -387,6 +387,7 @@ struct Decoder::Impl_ {
             gst_object_unref(bus);
             g_object_unref(sink);
             gst_element_set_state(pl, GST_STATE_NULL);
+            gst_element_get_state(pl, nullptr, nullptr, GST_CLOCK_TIME_NONE); // 补上这一行
             gst_object_unref(pl);
             return false;
         }
