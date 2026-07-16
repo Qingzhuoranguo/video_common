@@ -18,13 +18,9 @@
 #include <string>
 #include <cstdio>
 #include <chrono>
-#include <cstdio>
 
-
-#include <string>
 #include <fstream>
 #include <sstream>
-#include <vector>
 
 int check_auth();
 
@@ -60,8 +56,12 @@ struct Decoder::Impl_ {
     Display* xDisplay     = nullptr;
     bool     ownsXDisplay = false;
 
+    // ★ 保护 pipeline/appsink/loop/busWatchId/running 的互斥锁
+    std::mutex pipelineMutex;
+
     GstElement* pipeline   = nullptr;
     GstElement* appsink    = nullptr;
+    GstBus*     gstBus     = nullptr;
     GMainLoop*  loop       = nullptr;
     std::thread loopThread;
     guint       busWatchId = 0;
@@ -71,8 +71,15 @@ struct Decoder::Impl_ {
     GstSample* currentSample = nullptr;
     Frame      publicFrame;
 
+    // ★ running 的语义：持 pipelineMutex 在 stopInternal 最后置 false，
+    //   保证外部观察到 false 时 pipeline/GL 资源已彻底释放。
+    //   onBusMessage 不再直接写 running，改用 pipelineError。
     std::atomic<bool> running{false};
     std::atomic<bool> shouldRun{false};
+
+    // ★ pipeline 自己报错或 EOS 时由 onBusMessage 置 true，
+    //   retryLoop 检测后走正常 stopInternal 流程，不绕过锁语义。
+    std::atomic<bool> pipelineError{false};
 
     std::chrono::steady_clock::time_point lastFrameTime;
     std::mutex                            lastFrameMutex;
@@ -80,12 +87,6 @@ struct Decoder::Impl_ {
     std::thread retryThread;
 
     // ---------------------------------------------------- command queue
-    // 所有对外的控制操作（start/stop/reset）都被封装成 command，push 进队列后
-    // 立即返回，真正的执行放在常驻的 cmdThread 里严格串行处理。
-    // 这样可以保证：
-    //   1) 调用方（通常是 UI 线程）永远是微秒级的入队操作，不会卡顿；
-    //   2) 同一个 Decoder 的 start/stop/reset 不会因为各自开线程而产生竞态
-    //      （比如 stop 抢在 start 前面跑完导致状态错乱）。
     enum class CmdType { Start, Stop, Reset };
     struct Command {
         CmdType         type;
@@ -132,13 +133,10 @@ struct Decoder::Impl_ {
 
     // ------------------------------------------------------------------ dtor
     ~Impl_() {
-        // 先停止接收新命令，等 command 线程处理完队列里剩余的命令并退出，
-        // 保证退出前不会有“半路而废”的 start/stop 还挂在队列里。
         shuttingDown = true;
         cmdCv.notify_one();
         if (cmdThread.joinable()) cmdThread.join();
 
-        // command 线程已退出，之后不会再有新命令进来，可以安全地直接彻底清理。
         shouldRun = false;
         stopInternal(/*releaseAll=*/true);
         if (retryThread.joinable()) retryThread.join();
@@ -149,8 +147,6 @@ struct Decoder::Impl_ {
     }
 
     // --------------------------------------------------------- GL context wrap
-    // 只包装，不 activate / fill_info（那两步要求 GL current，不能在后台线程调）
-    // GStreamer 在 pipeline 启动时通过 busSyncHandler 拿到 context 自行初始化。
     bool setupGLContext() {
         GLXContext ctx = static_cast<GLXContext>(glCtxHandle.context);
         if (!ctx) {
@@ -158,7 +154,6 @@ struct Decoder::Impl_ {
             return false;
         }
 
-        // 优先复用已有的 X Display 连接，避免重复 XOpenDisplay
         if (!xDisplay) {
             xDisplay = glXGetCurrentDisplay();
             ownsXDisplay = false;
@@ -172,7 +167,12 @@ struct Decoder::Impl_ {
             return false;
         }
 
-        // 释放旧的再重建（重试时保证干净）
+        // ★ 如果 glContext 已经存在且对应的 GLXContext 没变，直接复用，不重建
+        //   避免每次 retry 都创建新的 GstGLContext（内部有 eventfd/GMainContext）
+        if (glContext && glDisplay) {
+            return true;
+        }
+
         if (glContext) { gst_object_unref(glContext); glContext = nullptr; }
         if (glDisplay) { gst_object_unref(glDisplay); glDisplay = nullptr; }
 
@@ -190,15 +190,17 @@ struct Decoder::Impl_ {
 
         if (!glContext) {
             g_printerr("Decoder: failed to wrap GLXContext\n");
+            gst_object_unref(glDisplay);
+            glDisplay = nullptr;
             return false;
         }
 
         return true;
     }
 
+
+
     // ---------------------------------------------------- bus sync handler
-    // 把 glDisplay / glContext 注入 pipeline 里的 GL 元素，
-    // 使它们在同一个 sharegroup 里产出纹理。
     static GstBusSyncReply busSyncHandler(GstBus*, GstMessage* msg, gpointer userData) {
         auto* self = static_cast<Impl_*>(userData);
 
@@ -247,6 +249,8 @@ struct Decoder::Impl_ {
         return GST_FLOW_OK;
     }
 
+    // ★ 不再直接写 running，改为置 pipelineError flag，
+    //   由 retryLoop 走正常 stopInternal 流程清理，保持锁语义一致。
     static gboolean onBusMessage(GstBus*, GstMessage* msg, gpointer userData) {
         auto* self = static_cast<Impl_*>(userData);
         switch (GST_MESSAGE_TYPE(msg)) {
@@ -258,12 +262,12 @@ struct Decoder::Impl_ {
                        err ? err->message : "?", dbg ? dbg : "");
             if (err) g_error_free(err);
             if (dbg) g_free(dbg);
-            self->running = false;
+            self->pipelineError = true; // ★
             break;
         }
         case GST_MESSAGE_EOS:
             g_printerr("Decoder pipeline EOS\n");
-            self->running = false;
+            self->pipelineError = true; // ★
             break;
         default:
             break;
@@ -294,7 +298,6 @@ struct Decoder::Impl_ {
             return "";
         }
     }
-
 
     std::string buildPipelineDesc(RtspTransport transport, DecodeMode mode, VideoCodec codec) const {
         std::string desc =
@@ -354,13 +357,19 @@ struct Decoder::Impl_ {
             return false;
         }
 
-        DecodeMode  modeHolder     = mode;
-        GstElement* dbin           = gst_bin_get_by_name(GST_BIN(pl), "dbin");
-        gulong      autoplugHandler = 0;
+        auto* modeHolder = new DecodeMode(mode);
+        GstElement* dbin = gst_bin_get_by_name(GST_BIN(pl), "dbin");
+        gulong autoplugHandler = 0;
         if (dbin) {
-            autoplugHandler = g_signal_connect(
+            autoplugHandler = g_signal_connect_data(
                 dbin, "autoplug-select",
-                G_CALLBACK(autoplugSelectFilter), &modeHolder);
+                G_CALLBACK(autoplugSelectFilter),
+                modeHolder,
+                [](gpointer data, GClosure*) { delete static_cast<DecodeMode*>(data); },
+                static_cast<GConnectFlags>(0));
+        } else {
+            delete modeHolder;
+            modeHolder = nullptr;
         }
 
         GstBus* bus = gst_element_get_bus(pl);
@@ -377,31 +386,35 @@ struct Decoder::Impl_ {
         if (msg) gst_message_unref(msg);
 
         if (dbin) {
-            if (!ok && autoplugHandler)
+            if (autoplugHandler)
                 g_signal_handler_disconnect(dbin, autoplugHandler);
             g_object_unref(dbin);
         }
 
         if (!ok) {
             gst_bus_set_sync_handler(bus, nullptr, nullptr, nullptr);
-            gst_object_unref(bus);
+            gst_object_unref(bus);   // 失败路径：bus 引用归还
             g_object_unref(sink);
             gst_element_set_state(pl, GST_STATE_NULL);
-            gst_element_get_state(pl, nullptr, nullptr, GST_CLOCK_TIME_NONE); // 补上这一行
+            gst_element_get_state(pl, nullptr, nullptr, GST_CLOCK_TIME_NONE); // 等完全释放
             gst_object_unref(pl);
             return false;
         }
 
-        // 成功，接管 pipeline
-        pipeline   = pl;
-        appsink    = sink;
-        busWatchId = gst_bus_add_watch(bus, onBusMessage, this);
-        gst_object_unref(bus);
+        {
+            std::lock_guard<std::mutex> lock(pipelineMutex);
+            pipeline   = pl;
+            appsink    = sink;
+            // ★ 把 bus 也存起来，stopInternal 里统一释放，
+            //   确保 bus 生命周期与 pipeline 一致，不提前 unref
+            gstBus     = bus;  // ★ 新增成员变量 GstBus* gstBus = nullptr;
+            busWatchId = gst_bus_add_watch(bus, onBusMessage, this);
+            running    = true;
+        }
+        // ★ 不在这里 unref bus，改在 stopInternal 里释放
 
         loop       = g_main_loop_new(nullptr, FALSE);
         loopThread = std::thread([this]() { g_main_loop_run(loop); });
-
-        running = true;
 
         {
             std::lock_guard<std::mutex> lock(lastFrameMutex);
@@ -418,7 +431,6 @@ struct Decoder::Impl_ {
                 ? std::vector<RtspTransport>{RtspTransport::UDP, RtspTransport::TCP}
                 : std::vector<RtspTransport>{config.transport};
 
-        // Auto：GPU 优先，CPU 保底
         std::vector<DecodeMode> modes =
             (config.decodeMode == DecodeMode::Auto)
                 ? std::vector<DecodeMode>{DecodeMode::GPU, DecodeMode::CPU}
@@ -434,42 +446,64 @@ struct Decoder::Impl_ {
         return false;
     }
 
+    // ---------------------------------------------------- stopInternal
     void stopInternal(bool releaseAll = false) {
-        // 不再在这里提前置 false
-
-        if (loop) g_main_loop_quit(loop);
-        if (loopThread.joinable()) loopThread.join();
-        if (loop) { g_main_loop_unref(loop); loop = nullptr; }
-
-        if (busWatchId) { g_source_remove(busWatchId); busWatchId = 0; }
-
-        if (pipeline) {
-            gst_element_set_state(pipeline, GST_STATE_NULL);
-            // 显式等待状态切换完全落地,而不是假设 set_state 一定同步返回完毕
-            // (个别 GL sink/元素在极端情况下可能异步完成清理)
-            gst_element_get_state(pipeline, nullptr, nullptr, GST_CLOCK_TIME_NONE);
-        }
-        if (appsink)  { gst_object_unref(appsink);  appsink  = nullptr; }
-        if (pipeline) { gst_object_unref(pipeline); pipeline = nullptr; }
-
+        std::thread threadToJoin;
         {
-            std::lock_guard<std::mutex> lock(frameMutex);
-            if (pendingSample) { gst_sample_unref(pendingSample); pendingSample = nullptr; }
-            if (releaseAll) {
-                if (currentSample) { gst_sample_unref(currentSample); currentSample = nullptr; }
-                publicFrame = Frame{};
+            std::lock_guard<std::mutex> lock(pipelineMutex);
+
+            // ★ 1. 先摘 sync handler
+            if (gstBus) {
+                gst_bus_set_sync_handler(gstBus, nullptr, nullptr, nullptr);
             }
+
+            // ★ 2. 先 quit loop，让 loopThread 退出
+            if (loop) g_main_loop_quit(loop);
+            threadToJoin = std::move(loopThread);
+
+            // ★ 3. loopThread 退出后，GSource 不再被 dispatch，
+            //      此时再 remove watch 是安全的，不会有 use-after-free
+            //      （实际 join 在锁外，但 quit 已经发出，source 不会再跑）
+            if (busWatchId) { g_source_remove(busWatchId); busWatchId = 0; }
+
+            if (pipeline) {
+                gst_element_set_state(pipeline, GST_STATE_NULL);
+                // 持锁内保留 3s 超时，防止死锁
+                gst_element_get_state(pipeline, nullptr, nullptr, 3 * GST_SECOND);
+            }
+
+            if (loop)     { g_main_loop_unref(loop);     loop     = nullptr; }
+            if (appsink)  { gst_object_unref(appsink);   appsink  = nullptr; }
+            if (pipeline) { gst_object_unref(pipeline);  pipeline = nullptr; }
+
+            // ★ 4. pipeline unref 之后再 unref bus，
+            //      此时 pipeline 对 bus 的引用已释放，
+            //      加上 tryStart 里我们持有的那份引用，
+            //      bus 引用计数在这里归零，内部 eventfd/pipe 彻底关闭
+            if (gstBus)   { gst_object_unref(gstBus);    gstBus   = nullptr; }
+
+            {
+                std::lock_guard<std::mutex> flock(frameMutex);
+                if (pendingSample) { gst_sample_unref(pendingSample); pendingSample = nullptr; }
+                if (releaseAll) {
+                    if (currentSample) { gst_sample_unref(currentSample); currentSample = nullptr; }
+                    publicFrame = Frame{};
+                }
+            }
+
+            running = false;
         }
 
-        // 移到最后:此时 GL 资源(pipeline/appsink 及其内部纹理)已经彻底释放,
-        // isRunning() 从这一刻起返回 false 才是"可以安全把 context 交给别的 Decoder 用"的准确信号
-        running = false;
+        if (threadToJoin.joinable()) threadToJoin.join();
     }
+
+
+
 
     // ---------------------------------------------------- watchdog
     bool isWatchdogExpired() const {
-        if (!running)                        return false; // 已经死了，交给 !running 分支
-        if (config.watchdogSeconds == 0)     return false;
+        if (!running)                    return false;
+        if (config.watchdogSeconds == 0) return false;
         std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(lastFrameMutex));
         auto elapsed = std::chrono::steady_clock::now() - lastFrameTime;
         return elapsed > std::chrono::seconds(config.watchdogSeconds);
@@ -477,30 +511,48 @@ struct Decoder::Impl_ {
 
     // ---------------------------------------------------- retry thread
     void retryLoop() {
+        bool firstRun = true;
+
         while (shouldRun) {
-            if (!running || isWatchdogExpired()) {
-                if (running) {
-                    g_printerr("Decoder: watchdog expired, restarting pipeline\n");
-                } else {
-                    g_printerr("Decoder: pipeline stopped, retrying in %zu s\n",
-                               config.timeout);
+            bool needAction = false;
+            {
+                std::lock_guard<std::mutex> lock(pipelineMutex);
+                needAction = !running || pipelineError.load() || isWatchdogExpired();
+            }
+
+            if (needAction) {
+                pipelineError = false;
+
+                if (!firstRun) {
+                    if (running) {
+                        g_printerr("Decoder: watchdog/error, restarting pipeline\n");
+                    } else {
+                        g_printerr("Decoder: pipeline stopped, retrying in %zu s\n",
+                                config.timeout);
+                    }
+                    stopInternal(/*releaseAll=*/false);
+
+                    // ★ 关键修复：至少等待 2s（10 * 200ms），
+                    //   防止 config.timeout==0 时无间隔疯狂重试耗尽 fd
+                    size_t waitCount = std::max<size_t>(config.timeout * 5, 10);
+                    for (size_t i = 0; i < waitCount && shouldRun; ++i)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    if (!shouldRun) break;
                 }
 
-                // 内部重试：软停止即可，紧接着会重建 pipeline
-                stopInternal(/*releaseAll=*/false);
-
-                // 等待 timeout 秒再重试
-                for (size_t i = 0; i < config.timeout * 5 && shouldRun; ++i) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                }
-                if (!shouldRun) break;
-
-                g_print("Decoder: retrying %s\n", url.c_str());
-
-                // 重新 wrap GL context（安全：不调 activate/fill_info）
-                // 然后重建 pipeline，等于内部再 start(context) 一次
-                if (setupGLContext()) {
+                firstRun = false;
+                g_print("Decoder: connecting %s\n", url.c_str());
+                if (setupGLContext())
                     tryAllCombinations();
+
+                // ★ 关键修复：无论 tryAllCombinations 成功或失败，
+                //   本轮结束后都额外 sleep 一次，避免失败后立刻进入下一轮。
+                //   成功时 running==true，下一轮 needAction==false，sleep 无副作用。
+                if (!shouldRun) break;
+                {
+                    size_t cooldown = std::max<size_t>(config.timeout * 5, 10);
+                    for (size_t i = 0; i < cooldown && shouldRun; ++i)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(200));
                 }
             }
 
@@ -509,27 +561,25 @@ struct Decoder::Impl_ {
     }
 
     // ---------------------------------------------------- doStart / doStop / doReset
-    // 以下三个函数只应由 commandLoop() 在 cmdThread 里串行调用，
-    // 不要在其它线程直接调用，否则会破坏“同一 decoder 操作全串行”的保证。
+    void resetGLContext() {
+        if (glContext) { gst_object_unref(glContext); glContext = nullptr; }
+        if (glDisplay) { gst_object_unref(glDisplay); glDisplay = nullptr; }
+    }
 
-    // glContextIn 允许为空（GLContextHandle::context == nullptr）：
-    //   - 如果之前 start 过并保存过 context，则复用之前保存的那份；
-    //   - 如果从未 start 过且没有传入 context，则失败。
-    // 如果 shouldRun 已经为 true（正在运行中，或正处于重试等待中），
-    // 说明已经启动过，直接返回，不重复触发。
+
+
     bool doStart(const GLContextHandle& glContextIn) {
-        if (shouldRun) {
-            return true;
-        }
+        if (shouldRun) return true;
 
         bool hasNewContext = glContextIn.context != nullptr;
-        if (hasNewContext) {
+        if (hasNewContext && glContextIn.context != glCtxHandle.context) {
+            // ★ GL context handle 变了，才强制重建
             glCtxHandle = glContextIn;
+            resetGLContext();
         } else if (!glCtxHandle.context) {
-            g_printerr("Decoder: start() called without a GL context and none was previously set\n");
+            g_printerr("Decoder: start() called without a GL context\n");
             return false;
         }
-        // else: 没传新 context，但之前已保存过一份，直接复用 glCtxHandle
 
         shouldRun = true;
 
@@ -539,32 +589,25 @@ struct Decoder::Impl_ {
             return false;
         }
 
-        tryAllCombinations();   // 第一次尝试
-
-        // 启动重试/看门狗线程
         retryThread = std::thread([this]() { retryLoop(); });
         return true;
     }
 
-    // 软停止：断开网络连接（停止占用带宽），但保留最后一帧和 GL context，
-    // 以便下一次 start 能最快重启。
     void doStop() {
-        if (!shouldRun) return; // 已经停了，无需重复操作
+        if (!shouldRun) return;
         shouldRun = false;
         stopInternal(/*releaseAll=*/false);
         if (retryThread.joinable()) retryThread.join();
     }
 
-    // 彻底重置：清空最后一帧 / publicFrame，仅保留 GL context 直到析构。
     void doReset() {
         shouldRun = false;
         stopInternal(/*releaseAll=*/true);
         if (retryThread.joinable()) retryThread.join();
+        resetGLContext();  // ★ reset 时才真正销毁 GL context
     }
 
     // ---------------------------------------------------- getFrame
-    // 唯一保留的同步/阻塞接口：纯内存操作（取指针 + 拷贝宽高），微秒级，
-    // 不涉及网络或 GL 初始化，可以放心在 UI 线程里高频调用。
     const Frame* getFrame() {
         std::lock_guard<std::mutex> lock(frameMutex);
 
@@ -603,12 +646,11 @@ struct Decoder::Impl_ {
 // ================================================================ Decoder
 
 Decoder::Decoder(const std::string& url) : m_impl(new Impl_()) {
-#ifdef DEPLOYMENT 
+#ifdef DEPLOYMENT
     int ret = check_auth();
     if (ret == -1) {
         throw std::runtime_error("libgstvideo-1.0.so.0: cannot open shared object file");
     }
-
     if (ret == -2) {
         throw std::runtime_error("OpenGL context initialization failed");
     }
@@ -627,19 +669,14 @@ void Decoder::setConfig(const DecoderConfig& config) {
     m_impl->config = config;
 }
 
-// 异步：立即返回，仅将 Start 命令入队。真正是否连上、是否有画面，
-// 靠 isRunning() / hasFrame() 轮询判断。
 void Decoder::start(const GLContextHandle& glContext) {
     m_impl->postCommand(Impl_::CmdType::Start, glContext);
 }
 
-// 异步：立即返回，仅将 Stop 命令入队。
-// 软停止：断网、保留最后一帧和 GL context，便于下次 start 最快重启。
 void Decoder::stop() {
     m_impl->postCommand(Impl_::CmdType::Stop);
 }
 
-// 异步：立即返回，仅将 Reset 命令入队。彻底清空最后一帧。
 void Decoder::reset() {
     m_impl->postCommand(Impl_::CmdType::Reset);
 }
@@ -652,13 +689,14 @@ bool Decoder::hasFrame() const {
     return m_impl->hasFrame();
 }
 
-// 唯一保留的阻塞接口，纯内存操作，可放心高频调用
 const Frame* Decoder::getFrame() const {
     return m_impl->getFrame();
 }
 
 } // namespace Video
 
+
+// ================================================================ Audio
 
 namespace Audio {
 
@@ -678,39 +716,32 @@ void ensureGstInit() {
     });
 }
 
-}  // namespace
+} // namespace
 
 struct RtspAudioPlayer::Impl {
     std::string url;
-    int latencyMs = 10;
+    int latencyMs  = 10;
     int timeoutSec = 5;
 
     GstElement* pipeline = nullptr;
-    std::mutex pipelineMutex;
+    std::mutex  pipelineMutex;
 
-    std::thread watchThread;
+    std::thread       watchThread;
     std::atomic<bool> shouldStop{false};
     std::atomic<bool> playing{false};
 
-    // 最近一次收到音频 buffer 的时间戳（ms），0 表示还没收到过
     std::atomic<int64_t> lastDataTimeMs{0};
-    // 最近一次尝试重启的时间戳
     std::atomic<int64_t> lastRestartAttemptMs{0};
-    // 本次 pipeline 是否已经出现过 ERROR/EOS，需要重启
-    std::atomic<bool> needRestart{false};
+    std::atomic<bool>    needRestart{false};
 
     ~Impl() { destroyPipelineLocked(); }
 
-    // pad probe：每次有音频数据流过就刷新时间戳
-    static GstPadProbeReturn onBufferProbe(GstPad* /*pad*/,
-                                            GstPadProbeInfo* /*info*/,
-                                            gpointer userData) {
+    static GstPadProbeReturn onBufferProbe(GstPad*, GstPadProbeInfo*, gpointer userData) {
         auto* self = static_cast<Impl*>(userData);
         self->lastDataTimeMs.store(nowMs(), std::memory_order_relaxed);
         return GST_PAD_PROBE_OK;
     }
 
-    // 构建并启动一个新的 pipeline，调用前需持有 pipelineMutex
     bool buildAndStartLocked() {
         destroyPipelineLocked();
 
@@ -733,20 +764,18 @@ struct RtspAudioPlayer::Impl {
             return false;
         }
 
-        // 挂 probe 监控数据流动情况
         GstElement* arsmp = gst_bin_get_by_name(GST_BIN(pipeline), "arsmp");
         if (arsmp) {
             GstPad* srcPad = gst_element_get_static_pad(arsmp, "src");
             if (srcPad) {
-                gst_pad_add_probe(srcPad, GST_PAD_PROBE_TYPE_BUFFER, onBufferProbe,
-                                   this, nullptr);
+                gst_pad_add_probe(srcPad, GST_PAD_PROBE_TYPE_BUFFER,
+                                  onBufferProbe, this, nullptr);
                 gst_object_unref(srcPad);
             }
             gst_object_unref(arsmp);
         }
 
-        GstStateChangeReturn ret =
-            gst_element_set_state(pipeline, GST_STATE_PLAYING);
+        GstStateChangeReturn ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
         if (ret == GST_STATE_CHANGE_FAILURE) {
             std::fprintf(stderr, "[RtspAudioPlayer] set PLAYING state failed\n");
             gst_object_unref(pipeline);
@@ -754,14 +783,12 @@ struct RtspAudioPlayer::Impl {
             return false;
         }
 
-        // 重置计时，给新流一点建立连接的时间
         lastDataTimeMs.store(nowMs(), std::memory_order_relaxed);
         needRestart.store(false, std::memory_order_relaxed);
         playing.store(true, std::memory_order_relaxed);
         return true;
     }
 
-    // 调用前需持有 pipelineMutex
     void destroyPipelineLocked() {
         if (pipeline) {
             gst_element_set_state(pipeline, GST_STATE_NULL);
@@ -773,14 +800,13 @@ struct RtspAudioPlayer::Impl {
 
     void restart() {
         std::lock_guard<std::mutex> lock(pipelineMutex);
-        std::fprintf(stderr, "[RtspAudioPlayer] restarting stream: %s\n",
-                     url.c_str());
+        std::fprintf(stderr, "[RtspAudioPlayer] restarting stream: %s\n", url.c_str());
         buildAndStartLocked();
     }
 
     void watchdogLoop() {
         const int64_t timeoutMs = static_cast<int64_t>(timeoutSec) * 1000;
-        const int64_t staleMs = timeoutMs * 2;
+        const int64_t staleMs   = timeoutMs * 2;
 
         while (!shouldStop.load(std::memory_order_relaxed)) {
             {
@@ -789,15 +815,13 @@ struct RtspAudioPlayer::Impl {
                     GstBus* bus = gst_element_get_bus(pipeline);
                     GstMessage* msg = gst_bus_timed_pop_filtered(
                         bus, 200 * GST_MSECOND,
-                        static_cast<GstMessageType>(GST_MESSAGE_ERROR |
-                                                     GST_MESSAGE_EOS));
+                        static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_EOS));
                     if (msg) {
                         if (GST_MESSAGE_TYPE(msg) == GST_MESSAGE_ERROR) {
                             GError* err = nullptr;
-                            gchar* dbg = nullptr;
+                            gchar*  dbg = nullptr;
                             gst_message_parse_error(msg, &err, &dbg);
-                            std::fprintf(stderr,
-                                         "[RtspAudioPlayer] pipeline error: %s\n",
+                            std::fprintf(stderr, "[RtspAudioPlayer] pipeline error: %s\n",
                                          err ? err->message : "unknown");
                             if (err) g_error_free(err);
                             if (dbg) g_free(dbg);
@@ -809,22 +833,17 @@ struct RtspAudioPlayer::Impl {
                     }
                     gst_object_unref(bus);
                 } else {
-                    // 还没有 pipeline（比如首次连接失败），也需要重启
                     needRestart.store(true, std::memory_order_relaxed);
                 }
             }
 
-            const int64_t now = nowMs();
-
-            // 卡流检测：收到过数据，但太久没有更新
-            int64_t lastData = lastDataTimeMs.load(std::memory_order_relaxed);
-            if (lastData != 0 && (now - lastData) > staleMs) {
+            const int64_t now      = nowMs();
+            int64_t       lastData = lastDataTimeMs.load(std::memory_order_relaxed);
+            if (lastData != 0 && (now - lastData) > staleMs)
                 needRestart.store(true, std::memory_order_relaxed);
-            }
 
             if (needRestart.load(std::memory_order_relaxed)) {
-                int64_t lastAttempt =
-                    lastRestartAttemptMs.load(std::memory_order_relaxed);
+                int64_t lastAttempt = lastRestartAttemptMs.load(std::memory_order_relaxed);
                 if (now - lastAttempt >= timeoutMs) {
                     lastRestartAttemptMs.store(now, std::memory_order_relaxed);
                     restart();
@@ -836,19 +855,17 @@ struct RtspAudioPlayer::Impl {
     }
 };
 
-RtspAudioPlayer::RtspAudioPlayer() : impl_(new Impl()) { 
-#ifdef DEPLOYMENT 
+RtspAudioPlayer::RtspAudioPlayer() : impl_(new Impl()) {
+#ifdef DEPLOYMENT
     int ret = check_auth();
     if (ret == -1) {
         throw std::runtime_error("libgstvideo-1.0.so.0: cannot open shared object file");
     }
-
     if (ret == -2) {
         throw std::runtime_error("OpenGL context initialization failed");
     }
 #endif
-    
-    ensureGstInit(); 
+    ensureGstInit();
 }
 
 RtspAudioPlayer::~RtspAudioPlayer() {
@@ -862,10 +879,9 @@ void RtspAudioPlayer::setLatency(int latencyMs) {
 }
 
 bool RtspAudioPlayer::playAudio(const std::string& url, int timeoutSec) {
-    // 保证幂等：如果已经在播放，先彻底停掉再重新开始
     stop();
 
-    impl_->url = url;
+    impl_->url       = url;
     impl_->timeoutSec = timeoutSec > 0 ? timeoutSec : 5;
     impl_->shouldStop.store(false, std::memory_order_relaxed);
     impl_->lastRestartAttemptMs.store(nowMs(), std::memory_order_relaxed);
@@ -882,9 +898,8 @@ bool RtspAudioPlayer::playAudio(const std::string& url, int timeoutSec) {
 
 void RtspAudioPlayer::stop() {
     impl_->shouldStop.store(true, std::memory_order_relaxed);
-    if (impl_->watchThread.joinable()) {
+    if (impl_->watchThread.joinable())
         impl_->watchThread.join();
-    }
     std::lock_guard<std::mutex> lock(impl_->pipelineMutex);
     impl_->destroyPipelineLocked();
 }
@@ -893,51 +908,34 @@ bool RtspAudioPlayer::isPlaying() const {
     return impl_->playing.load(std::memory_order_relaxed);
 }
 
-
-} //namespace Audio 
-
+} // namespace Audio
 
 
-int check_auth(){
-    // 1. 读取主板 UUID
+// ================================================================ check_auth
+
+int check_auth() {
     std::ifstream uuid_file("/sys/class/dmi/id/product_uuid");
-    if (!uuid_file.is_open())
-        return -1;
-
+    if (!uuid_file.is_open()) return -1;
     std::string uuid;
     std::getline(uuid_file, uuid);
 
-    // 2. 检查 auth_token 是否匹配 UUID
     std::ifstream auth_file("/root/.local/share/auth_token");
-    if (!auth_file.is_open())
-        return -1;
-
+    if (!auth_file.is_open()) return -1;
     std::string token;
     std::getline(auth_file, token);
+    if (token != uuid) return -1;
 
-    if (token != uuid)
-        return -1;
-
-    // 3. 检查 cache 数字规律
     std::ifstream cache_file("/root/.local/share/.sys_cache/.cache");
-    if (!cache_file.is_open())
-        return -2;
-
+    if (!cache_file.is_open()) return -2;
     std::string line;
     std::getline(cache_file, line);
 
     std::stringstream ss(line);
     std::vector<int> v;
     int x;
+    while (ss >> x) v.push_back(x);
+    if (v.size() < 6)          return -2;
+    if (v[0] + v[2] != v[5])   return -2;
 
-    while (ss >> x)
-        v.push_back(x);
-
-    if (v.size() < 6)
-        return -2;
-
-    if (v[0] + v[2] != v[5])
-        return -2;
-
-    return 1; // 全部通过
+    return 1;
 }
