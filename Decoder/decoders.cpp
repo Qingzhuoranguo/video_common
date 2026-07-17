@@ -14,7 +14,7 @@
 #include <thread>
 #include <atomic>
 #include <vector>
-#include <deque>
+#include <optional>
 #include <string>
 #include <cstdio>
 #include <chrono>
@@ -71,14 +71,8 @@ struct Decoder::Impl_ {
     GstSample* currentSample = nullptr;
     Frame      publicFrame;
 
-    // ★ running 的语义：持 pipelineMutex 在 stopInternal 最后置 false，
-    //   保证外部观察到 false 时 pipeline/GL 资源已彻底释放。
-    //   onBusMessage 不再直接写 running，改用 pipelineError。
     std::atomic<bool> running{false};
     std::atomic<bool> shouldRun{false};
-
-    // ★ pipeline 自己报错或 EOS 时由 onBusMessage 置 true，
-    //   retryLoop 检测后走正常 stopInternal 流程，不绕过锁语义。
     std::atomic<bool> pipelineError{false};
 
     std::chrono::steady_clock::time_point lastFrameTime;
@@ -87,7 +81,7 @@ struct Decoder::Impl_ {
     std::thread retryThread;
 
     // ---------------------------------------------------- command queue
-    enum class CmdType { Start, Stop, Reset };
+    enum class CmdType { Start, Stop };
     struct Command {
         CmdType         type;
         GLContextHandle ctx;
@@ -95,7 +89,7 @@ struct Decoder::Impl_ {
 
     std::mutex              cmdMutex;
     std::condition_variable cmdCv;
-    std::deque<Command>     cmdQueue;
+    std::optional<Command>  pendingCmd;   // ★ 最多一个等待命令，新命令覆盖旧命令
     std::thread             cmdThread;
     std::atomic<bool>       shuttingDown{false};
 
@@ -109,16 +103,15 @@ struct Decoder::Impl_ {
             {
                 std::unique_lock<std::mutex> lock(cmdMutex);
                 cmdCv.wait(lock, [this]() {
-                    return !cmdQueue.empty() || shuttingDown;
+                    return pendingCmd.has_value() || shuttingDown;
                 });
-                if (shuttingDown && cmdQueue.empty()) return;
-                cmd = cmdQueue.front();
-                cmdQueue.pop_front();
+                if (shuttingDown && !pendingCmd.has_value()) return;
+                cmd = *pendingCmd;
+                pendingCmd.reset();
             }
             switch (cmd.type) {
             case CmdType::Start: doStart(cmd.ctx); break;
             case CmdType::Stop:  doStop();         break;
-            case CmdType::Reset: doReset();        break;
             }
         }
     }
@@ -126,7 +119,11 @@ struct Decoder::Impl_ {
     void postCommand(CmdType type, const GLContextHandle& ctx = nullptr) {
         {
             std::lock_guard<std::mutex> lock(cmdMutex);
-            cmdQueue.push_back({type, ctx});
+            // ★ 双重保险：入队时检查当前状态，已是目标状态则丢弃
+            if (type == CmdType::Start && shouldRun.load()) return;
+            if (type == CmdType::Stop  && !shouldRun.load()) return;
+            // ★ 覆盖等待槽，保证最多一个待执行命令
+            pendingCmd = Command{type, ctx};
         }
         cmdCv.notify_one();
     }
@@ -167,8 +164,6 @@ struct Decoder::Impl_ {
             return false;
         }
 
-        // ★ 如果 glContext 已经存在且对应的 GLXContext 没变，直接复用，不重建
-        //   避免每次 retry 都创建新的 GstGLContext（内部有 eventfd/GMainContext）
         if (glContext && glDisplay) {
             return true;
         }
@@ -249,8 +244,6 @@ struct Decoder::Impl_ {
         return GST_FLOW_OK;
     }
 
-    // ★ 不再直接写 running，改为置 pipelineError flag，
-    //   由 retryLoop 走正常 stopInternal 流程清理，保持锁语义一致。
     static gboolean onBusMessage(GstBus*, GstMessage* msg, gpointer userData) {
         auto* self = static_cast<Impl_*>(userData);
         switch (GST_MESSAGE_TYPE(msg)) {
@@ -262,12 +255,12 @@ struct Decoder::Impl_ {
                        err ? err->message : "?", dbg ? dbg : "");
             if (err) g_error_free(err);
             if (dbg) g_free(dbg);
-            self->pipelineError = true; // ★
+            self->pipelineError = true;
             break;
         }
         case GST_MESSAGE_EOS:
             g_printerr("Decoder pipeline EOS\n");
-            self->pipelineError = true; // ★
+            self->pipelineError = true;
             break;
         default:
             break;
@@ -396,7 +389,7 @@ struct Decoder::Impl_ {
             gst_object_unref(bus);   // 失败路径：bus 引用归还
             g_object_unref(sink);
             gst_element_set_state(pl, GST_STATE_NULL);
-            gst_element_get_state(pl, nullptr, nullptr, GST_CLOCK_TIME_NONE); // 等完全释放
+            gst_element_get_state(pl, nullptr, nullptr, GST_CLOCK_TIME_NONE);
             gst_object_unref(pl);
             return false;
         }
@@ -405,13 +398,10 @@ struct Decoder::Impl_ {
             std::lock_guard<std::mutex> lock(pipelineMutex);
             pipeline   = pl;
             appsink    = sink;
-            // ★ 把 bus 也存起来，stopInternal 里统一释放，
-            //   确保 bus 生命周期与 pipeline 一致，不提前 unref
-            gstBus     = bus;  // ★ 新增成员变量 GstBus* gstBus = nullptr;
+            gstBus     = bus;
             busWatchId = gst_bus_add_watch(bus, onBusMessage, this);
             running    = true;
         }
-        // ★ 不在这里 unref bus，改在 stopInternal 里释放
 
         loop       = g_main_loop_new(nullptr, FALSE);
         loopThread = std::thread([this]() { g_main_loop_run(loop); });
@@ -452,23 +442,17 @@ struct Decoder::Impl_ {
         {
             std::lock_guard<std::mutex> lock(pipelineMutex);
 
-            // ★ 1. 先摘 sync handler
             if (gstBus) {
                 gst_bus_set_sync_handler(gstBus, nullptr, nullptr, nullptr);
             }
 
-            // ★ 2. 先 quit loop，让 loopThread 退出
             if (loop) g_main_loop_quit(loop);
             threadToJoin = std::move(loopThread);
 
-            // ★ 3. loopThread 退出后，GSource 不再被 dispatch，
-            //      此时再 remove watch 是安全的，不会有 use-after-free
-            //      （实际 join 在锁外，但 quit 已经发出，source 不会再跑）
             if (busWatchId) { g_source_remove(busWatchId); busWatchId = 0; }
 
             if (pipeline) {
                 gst_element_set_state(pipeline, GST_STATE_NULL);
-                // 持锁内保留 3s 超时，防止死锁
                 gst_element_get_state(pipeline, nullptr, nullptr, 3 * GST_SECOND);
             }
 
@@ -476,10 +460,6 @@ struct Decoder::Impl_ {
             if (appsink)  { gst_object_unref(appsink);   appsink  = nullptr; }
             if (pipeline) { gst_object_unref(pipeline);  pipeline = nullptr; }
 
-            // ★ 4. pipeline unref 之后再 unref bus，
-            //      此时 pipeline 对 bus 的引用已释放，
-            //      加上 tryStart 里我们持有的那份引用，
-            //      bus 引用计数在这里归零，内部 eventfd/pipe 彻底关闭
             if (gstBus)   { gst_object_unref(gstBus);    gstBus   = nullptr; }
 
             {
@@ -532,8 +512,6 @@ struct Decoder::Impl_ {
                     }
                     stopInternal(/*releaseAll=*/false);
 
-                    // ★ 关键修复：至少等待 2s（10 * 200ms），
-                    //   防止 config.timeout==0 时无间隔疯狂重试耗尽 fd
                     size_t waitCount = std::max<size_t>(config.timeout * 5, 10);
                     for (size_t i = 0; i < waitCount && shouldRun; ++i)
                         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -545,9 +523,6 @@ struct Decoder::Impl_ {
                 if (setupGLContext())
                     tryAllCombinations();
 
-                // ★ 关键修复：无论 tryAllCombinations 成功或失败，
-                //   本轮结束后都额外 sleep 一次，避免失败后立刻进入下一轮。
-                //   成功时 running==true，下一轮 needAction==false，sleep 无副作用。
                 if (!shouldRun) break;
                 {
                     size_t cooldown = std::max<size_t>(config.timeout * 5, 10);
@@ -560,20 +535,17 @@ struct Decoder::Impl_ {
         }
     }
 
-    // ---------------------------------------------------- doStart / doStop / doReset
+    // ---------------------------------------------------- doStart / doStop
     void resetGLContext() {
         if (glContext) { gst_object_unref(glContext); glContext = nullptr; }
         if (glDisplay) { gst_object_unref(glDisplay); glDisplay = nullptr; }
     }
 
-
-
     bool doStart(const GLContextHandle& glContextIn) {
-        if (shouldRun) return true;
+        if (shouldRun) return true;  // ★ 幂等：已经在跑，直接返回
 
         bool hasNewContext = glContextIn.context != nullptr;
         if (hasNewContext && glContextIn.context != glCtxHandle.context) {
-            // ★ GL context handle 变了，才强制重建
             glCtxHandle = glContextIn;
             resetGLContext();
         } else if (!glCtxHandle.context) {
@@ -594,17 +566,10 @@ struct Decoder::Impl_ {
     }
 
     void doStop() {
-        if (!shouldRun) return;
+        if (!shouldRun) return;  // ★ 幂等：已经停了，直接返回
         shouldRun = false;
         stopInternal(/*releaseAll=*/false);
         if (retryThread.joinable()) retryThread.join();
-    }
-
-    void doReset() {
-        shouldRun = false;
-        stopInternal(/*releaseAll=*/true);
-        if (retryThread.joinable()) retryThread.join();
-        resetGLContext();  // ★ reset 时才真正销毁 GL context
     }
 
     // ---------------------------------------------------- getFrame
@@ -675,10 +640,6 @@ void Decoder::start(const GLContextHandle& glContext) {
 
 void Decoder::stop() {
     m_impl->postCommand(Impl_::CmdType::Stop);
-}
-
-void Decoder::reset() {
-    m_impl->postCommand(Impl_::CmdType::Reset);
 }
 
 bool Decoder::isRunning() const {
