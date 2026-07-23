@@ -85,6 +85,7 @@ struct Decoder::Impl_ {
     struct Command {
         CmdType         type;
         GLContextHandle ctx;
+        uint64_t        seq = 0;   // ★★★ CHANGED: 命令序号，用于同步等待
     };
 
     std::mutex              cmdMutex;
@@ -92,6 +93,12 @@ struct Decoder::Impl_ {
     std::optional<Command>  pendingCmd;   // ★ 最多一个等待命令，新命令覆盖旧命令
     std::thread             cmdThread;
     std::atomic<bool>       shuttingDown{false};
+
+    // ★★★ CHANGED: 新增“期望运行状态”和“已执行完成序号”，用于修复竞态 + 支持同步 stop
+    std::atomic<bool>       desiredRunning{false};
+    uint64_t                nextSeq = 0;      // 仅在 cmdMutex 保护下访问
+    std::atomic<uint64_t>   execSeq{0};       // 已经执行完成的命令序号
+    std::condition_variable doneCv;           // 命令执行完成通知
 
     void startCommandThread() {
         cmdThread = std::thread([this]() { commandLoop(); });
@@ -113,19 +120,45 @@ struct Decoder::Impl_ {
             case CmdType::Start: doStart(cmd.ctx); break;
             case CmdType::Stop:  doStop();         break;
             }
+            // ★★★ CHANGED: 命令真正执行完毕后，更新 execSeq 并唤醒等待者（比如同步 stop()）
+            {
+                std::lock_guard<std::mutex> lock(cmdMutex);
+                if (cmd.seq > execSeq.load(std::memory_order_relaxed))
+                    execSeq.store(cmd.seq, std::memory_order_release);
+            }
+            doneCv.notify_all();
         }
     }
 
-    void postCommand(CmdType type, const GLContextHandle& ctx = nullptr) {
-        {
-            std::lock_guard<std::mutex> lock(cmdMutex);
-            // ★ 双重保险：入队时检查当前状态，已是目标状态则丢弃
-            if (type == CmdType::Start && shouldRun.load()) return;
-            if (type == CmdType::Stop  && !shouldRun.load()) return;
-            // ★ 覆盖等待槽，保证最多一个待执行命令
-            pendingCmd = Command{type, ctx};
+    // ★★★ CHANGED: postCommand 现在返回本次命令的 seq（若被去重则返回“已达成该意图”对应的 seq），
+    // 且去重判断改用 desiredRunning（同步写入，代表最新意图），而不是 shouldRun（滞后于实际执行）。
+    // 这是修复 bug 的关键：原来用 shouldRun 判断会导致后发的命令在旧命令还没执行时被错误丢弃。
+    uint64_t postCommand(CmdType type, const GLContextHandle& ctx = nullptr) {
+        std::lock_guard<std::mutex> lock(cmdMutex);
+        bool wantRun = (type == CmdType::Start);
+
+        if (desiredRunning.load() == wantRun) {
+            // 当前意图已经是目标状态（哪怕还没真正执行完），
+            // 不需要再入队新命令；调用者若需要同步等待，
+            // 等待 nextSeq 对应的最后一条命令执行完即可。
+            uint64_t seq = nextSeq;
+            cmdCv.notify_one();
+            return seq;
         }
+
+        desiredRunning.store(wantRun);
+        uint64_t seq = ++nextSeq;
+        pendingCmd = Command{type, ctx, seq};
         cmdCv.notify_one();
+        return seq;
+    }
+
+    // ★★★ CHANGED: 阻塞等待指定 seq 的命令执行完成（用于同步 stop）
+    void waitForSeq(uint64_t seq) {
+        std::unique_lock<std::mutex> lock(cmdMutex);
+        doneCv.wait(lock, [this, seq]() {
+            return execSeq.load(std::memory_order_acquire) >= seq;
+        });
     }
 
     // ------------------------------------------------------------------ dtor
@@ -389,22 +422,57 @@ struct Decoder::Impl_ {
             gst_object_unref(bus);   // 失败路径：bus 引用归还
             g_object_unref(sink);
             gst_element_set_state(pl, GST_STATE_NULL);
-            gst_element_get_state(pl, nullptr, nullptr, GST_CLOCK_TIME_NONE);
+            // ★★★ CHANGED: 原来是 GST_CLOCK_TIME_NONE（无界等待，驱动/element 卡死时会永久挂起），
+            // 改成有界超时，和 stopInternal() 里的 3 秒保持一致。
+            gst_element_get_state(pl, nullptr, nullptr, 3 * GST_SECOND);
             gst_object_unref(pl);
             return false;
         }
 
+        // ★★★ CHANGED: 把“安装新 pipeline”整体纳入 pipelineMutex 保护，
+        // 并在拿到锁之后重新检查一次 shouldRun。
+        //
+        // 原因：如果这里只锁住 pipeline/appsink/gstBus/running 的赋值，
+        // 而 loop/loopThread 的创建留在锁外面，就会出现这样的竞态：
+        //   1) 本函数刚把 pipeline/running 装好、释放了锁
+        //   2) 恰好这时 doStop() 跑 stopInternal()，看到 pipeline 非空就正确清理掉了，
+        //      但此刻 loop 还是 nullptr（还没执行到下面那两行），于是 stopInternal()
+        //      检查 `if (loop) ...` 直接跳过，什么都不做
+        //   3) 本函数才继续把 loop/loopThread 建出来
+        //   4) retryLoop() 发现 shouldRun 已经是 false，直接 break 退出，
+        //      不会再调用第二次 stopInternal()
+        // 最终这个刚建好的 loop/loopThread 永远没人退出/join，形成资源泄漏，
+        // 且 pipeline 已经在第2步被拆掉、但 loop 却是之后凭空建的，状态完全撕裂。
+        //
+        // 现在把 shouldRun 检查和 loop/loopThread 的创建都放进同一把锁：
+        //   - 如果 stopInternal() 先拿到锁：这里会看到 shouldRun==false，
+        //     直接丢弃刚建好的这个 pipeline，不安装、不留任何痕迹。
+        //   - 如果这里先拿到锁：整个 pipeline+loop+loopThread 一次性原子安装完毕，
+        //     之后 stopInternal()（不管什么时候来）拿到的都是完整、一致的状态，
+        //     能正确地把它全部清理掉。
+        // 两种情况都不会再出现“装了一半”的中间态被漏检查。
         {
             std::lock_guard<std::mutex> lock(pipelineMutex);
+
+            if (!shouldRun) {
+                gst_bus_set_sync_handler(bus, nullptr, nullptr, nullptr);
+                gst_object_unref(bus);
+                g_object_unref(sink);
+                gst_element_set_state(pl, GST_STATE_NULL);
+                gst_element_get_state(pl, nullptr, nullptr, 3 * GST_SECOND);
+                gst_object_unref(pl);
+                return false;
+            }
+
             pipeline   = pl;
             appsink    = sink;
             gstBus     = bus;
             busWatchId = gst_bus_add_watch(bus, onBusMessage, this);
             running    = true;
-        }
 
-        loop       = g_main_loop_new(nullptr, FALSE);
-        loopThread = std::thread([this]() { g_main_loop_run(loop); });
+            loop       = g_main_loop_new(nullptr, FALSE);
+            loopThread = std::thread([this]() { g_main_loop_run(loop); });
+        }
 
         {
             std::lock_guard<std::mutex> lock(lastFrameMutex);
@@ -634,12 +702,16 @@ void Decoder::setConfig(const DecoderConfig& config) {
     m_impl->config = config;
 }
 
+// ★★★ CHANGED: start 保持异步——发命令即返回，不阻塞调用者
 void Decoder::start(const GLContextHandle& glContext) {
     m_impl->postCommand(Impl_::CmdType::Start, glContext);
 }
 
+// ★★★ CHANGED: stop 改为同步——发命令后阻塞等待 cmdThread 真正执行完 doStop()
+// 才返回，保证调用方 stop() 返回时流已经彻底停止、资源已经清理干净。
 void Decoder::stop() {
-    m_impl->postCommand(Impl_::CmdType::Stop);
+    uint64_t seq = m_impl->postCommand(Impl_::CmdType::Stop);
+    m_impl->waitForSeq(seq);
 }
 
 bool Decoder::isRunning() const {
