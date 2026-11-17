@@ -328,7 +328,7 @@ struct Decoder::Impl_ {
     std::string buildPipelineDesc(RtspTransport transport, DecodeMode mode, VideoCodec codec) const {
         std::string desc =
             "rtspsrc name=src location=\"" + url +
-            "\" latency=0 protocols=" + transportStr(transport) + " ! ";
+            "\" latency=550 drop-on-latency=true do-retransmission=true protocols=" + transportStr(transport) + " ! ";
 
         if (codec == VideoCodec::Auto) {
             desc += "decodebin name=dbin ! "

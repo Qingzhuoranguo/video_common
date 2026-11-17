@@ -5,7 +5,7 @@ project(decoders LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_definitions(-DDEPLOYMENT)
+# add_definitions(-DDEPLOYMENT)
 
 find_package(PkgConfig REQUIRED)
 
