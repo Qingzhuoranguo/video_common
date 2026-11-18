@@ -21,6 +21,7 @@
 
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 
 int check_auth();
 
@@ -325,27 +326,90 @@ struct Decoder::Impl_ {
         }
     }
 
-    std::string buildPipelineDesc(RtspTransport transport, DecodeMode mode, VideoCodec codec) const {
+    static std::string buildTransformChain(const FrameTransform& t){
+        // 无变换
+        if (t.rotation == 0 &&
+            !t.flipHorizontal &&
+            !t.flipVertical)
+            return "";
+
+        // glvideoflip 的 method 是一个合成变换。
+        // 这里先支持单独旋转或单独翻转。
+        if (t.flipHorizontal && !t.flipVertical && t.rotation == 0)
+            return "glvideoflip method=horizontal-flip ! ";
+
+        if (t.flipVertical && !t.flipHorizontal && t.rotation == 0)
+            return "glvideoflip method=vertical-flip ! ";
+
+        if (!t.flipHorizontal && !t.flipVertical) {
+            switch (t.rotation) {
+            case 0:   return "";
+            case 90:  return "glvideoflip method=clockwise ! ";
+            case 180: return "glvideoflip method=rotate-180 ! ";
+            case 270: return "glvideoflip method=counterclockwise ! ";
+            }
+        }
+
+        // 多种变换组合：分别使用 GL 插件
+        std::string chain;
+
+        switch (t.rotation) {
+        case 0: break;
+        case 90:
+            chain += "glvideoflip method=clockwise ! ";
+            break;
+        case 180:
+            chain += "glvideoflip method=rotate-180 ! ";
+            break;
+        case 270:
+            chain += "glvideoflip method=counterclockwise ! ";
+            break;
+        default:
+            throw std::invalid_argument("Invalid rotation");
+        }
+
+        if (t.flipHorizontal)
+            chain += "glvideoflip method=horizontal-flip ! ";
+
+        if (t.flipVertical)
+            chain += "glvideoflip method=vertical-flip ! ";
+
+        return chain;
+    }
+    
+    std::string buildPipelineDesc(
+        RtspTransport transport,
+        DecodeMode mode,
+        VideoCodec codec) const
+    {
         std::string desc =
             "rtspsrc name=src location=\"" + url +
-            "\" latency=550 drop-on-latency=true do-retransmission=true protocols=" + transportStr(transport) + " ! ";
+            "\" latency=550 drop-on-latency=true "
+            "do-retransmission=true protocols=" +
+            transportStr(transport) + " ! ";
 
         if (codec == VideoCodec::Auto) {
             desc += "decodebin name=dbin ! "
                     "videoconvert ! "
                     "glupload ! glcolorconvert ! ";
-        } else if (mode == DecodeMode::CPU) {
-            desc += codecDecodeChain(codec, mode) + " ! "
-                                                    "videoconvert ! "
-                                                    "glupload ! glcolorconvert ! ";
-        } else {
-            desc += codecDecodeChain(codec, mode) + " ! "
-                                                    "glupload ! glcolorconvert ! ";
         }
+        else if (mode == DecodeMode::CPU) {
+            desc += codecDecodeChain(codec, mode) + " ! "
+                    "videoconvert ! "
+                    "glupload ! glcolorconvert ! ";
+        }
+        else {
+            desc += codecDecodeChain(codec, mode) + " ! "
+                    "glupload ! glcolorconvert ! ";
+        }
+
+        // GPU 图像变换
+        desc += buildTransformChain(config.transform);
 
         desc += "appsink name=sink "
                 "caps=\"video/x-raw(memory:GLMemory),format=RGBA\" "
                 "sync=false max-buffers=1 drop=true emit-signals=true";
+
         return desc;
     }
 

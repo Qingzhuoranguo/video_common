@@ -28,12 +28,26 @@ enum class RtspTransport {
     TCP
 };
 
+struct FrameTransform {
+    int cropX = 0;
+    int cropY = 0;
+    int cropWidth = 0;
+    int cropHeight = 0;
+
+    int rotation = 0;
+
+    bool flipHorizontal = false;
+    bool flipVertical = false;
+};
+
 struct DecoderConfig {
     DecodeMode   decodeMode = DecodeMode::Auto;
     VideoCodec   codec      = VideoCodec::Auto;
     RtspTransport transport = RtspTransport::Auto;
     size_t       timeout    = 5;
     size_t       watchdogSeconds = 10;
+
+    FrameTransform transform;
 };
 
 struct GLContextHandle {
